@@ -90,6 +90,7 @@ instance Arbitrary Handshake where
 			<*> arbitraryCiphersIDs
 			<*> arbitraryCompressionIDs
 			<*> (return [])
+			<*> (return Nothing)
 		, ServerHello
 			<$> arbitrary
 			<*> arbitrary

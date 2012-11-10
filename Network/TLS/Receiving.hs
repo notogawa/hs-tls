@@ -54,11 +54,16 @@ processPacket (Record ProtocolType_Handshake ver fragment) = do
 			Right hs -> return hs
 	return $ Handshake hss
 
+processPacket (Record ProtocolType_DeprecatedHandshake _ fragment) =
+	case decodeDeprecatedHandshake $ fragmentGetBytes fragment of
+		Left err -> throwError err
+		Right hs -> return $ Handshake [hs]
+
 processHandshake :: Handshake -> TLSSt ()
 processHandshake hs = do
 	clientmode <- isClientContext
 	case hs of
-		ClientHello cver ran _ _ _ ex -> unless clientmode $ do
+		ClientHello cver ran _ _ _ ex _ -> unless clientmode $ do
 			mapM_ processClientExtension ex
 			startHandshakeClient cver ran
 		Certificates certs            -> when clientmode $ do processCertificates certs

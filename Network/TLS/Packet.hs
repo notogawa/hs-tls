@@ -15,6 +15,8 @@ module Network.TLS.Packet
 	  CurrentParams(..)
 	-- * marshall functions for header messages
 	, decodeHeader
+	, decodeDeprecatedHeaderLength
+	, decodeDeprecatedHeader
 	, encodeHeader
 	, encodeHeaderNoVer -- use for SSL3
 
@@ -26,6 +28,7 @@ module Network.TLS.Packet
 	-- * marshall functions for handshake messages
 	, decodeHandshakes
 	, decodeHandshake
+	, decodeDeprecatedHandshake
 	, encodeHandshake
 	, encodeHandshakes
 	, encodeHandshakeHeader
@@ -54,6 +57,7 @@ import Network.TLS.Wire
 import Network.TLS.Cap
 import Data.Either (partitionEithers)
 import Data.Maybe (fromJust)
+import Data.Word
 import Data.Bits ((.|.))
 import Control.Applicative ((<$>))
 import Control.Monad
@@ -112,6 +116,16 @@ getHandshakeType = do
  -}
 decodeHeader :: ByteString -> Either TLSError Header
 decodeHeader = runGetErr "header" $ liftM3 Header getHeaderType getVersion getWord16
+
+decodeDeprecatedHeaderLength :: ByteString -> Either TLSError Word16
+decodeDeprecatedHeaderLength = runGetErr "deprecatedheaderlength" $ subtract 0x8000 <$> getWord16
+
+decodeDeprecatedHeader :: Word16 -> ByteString -> Either TLSError Header
+decodeDeprecatedHeader size =
+	runGetErr "deprecatedheader" $ do
+		1 <- getWord8
+		version <- getVersion
+		return $ Header ProtocolType_DeprecatedHandshake version size
 
 encodeHeader :: Header -> ByteString
 encodeHeader (Header pt ver len) = runPut (putHeaderType pt >> putVersion ver >> putWord16 len)
@@ -174,6 +188,28 @@ decodeHandshake cp ty = runGetErr "handshake" $ case ty of
 	HandshakeType_ClientKeyXchg   -> decodeClientKeyXchg
 	HandshakeType_Finished        -> decodeFinished
 
+decodeDeprecatedHandshake :: ByteString -> Either TLSError Handshake
+decodeDeprecatedHandshake b = runGetErr "deprecatedhandshake" getDeprecated b where
+	getDeprecated = do
+		1 <- getWord8
+		ver <- getVersion
+		cipherSpecLen <- fromEnum <$> getWord16
+		sessionIdLen <- fromEnum <$> getWord16
+		challengeLen <- fromEnum <$> getWord16
+		ciphers <- getCipherSpec cipherSpecLen
+		session <- getSessionId sessionIdLen
+		random <- getChallenge challengeLen
+		let compressions = [0]
+		return $ ClientHello ver random session ciphers compressions [] (Just b)
+	getCipherSpec len | len < 3 = return []
+	getCipherSpec len = do
+		[c0,c1,c2] <- map fromEnum <$> replicateM 3 getWord8
+		([ toEnum $ c1 * 0x100 + c2 | c0 == 0 ] ++) <$> getCipherSpec (len - 3)
+	getSessionId 0 = return $ Session Nothing
+	getSessionId len = Session . Just <$> getBytes len
+	getChallenge len | 32 < len = getBytes (len - 32) >> getChallenge 32
+	getChallenge len = ClientRandom . B.append (B.replicate (32 - len) 0) <$> getBytes len
+
 decodeHelloRequest :: Get Handshake
 decodeHelloRequest = return HelloRequest
 
@@ -188,7 +224,7 @@ decodeClientHello = do
 	exts <- if hasHelloExtensions ver && r > 0
 		then fmap fromIntegral getWord16 >>= getExtensions
 		else return []
-	return $ ClientHello ver random session ciphers compressions exts
+	return $ ClientHello ver random session ciphers compressions exts Nothing
 
 decodeServerHello :: Get Handshake
 decodeServerHello = do
@@ -285,7 +321,9 @@ encodeHandshake :: Handshake -> ByteString
 encodeHandshake o =
 	let content = runPut $ encodeHandshakeContent o in
 	let len = fromIntegral $ B.length content in
-	let header = runPut $ encodeHandshakeHeader (typeOfHandshake o) len in
+	let header = case o of
+			ClientHello _ _ _ _ _ _ (Just _) -> "" -- SSLv2 ClientHello message
+			_ -> runPut $ encodeHandshakeHeader (typeOfHandshake o) len in
 	B.concat [ header, content ]
 
 encodeHandshakes :: [Handshake] -> ByteString
@@ -296,7 +334,9 @@ encodeHandshakeHeader ty len = putWord8 (valOfType ty) >> putWord24 len
 
 encodeHandshakeContent :: Handshake -> Put
 
-encodeHandshakeContent (ClientHello version random session cipherIDs compressionIDs exts) = do
+encodeHandshakeContent (ClientHello _ _ _ _ _ _ (Just deprecated)) = do
+	putBytes deprecated
+encodeHandshakeContent (ClientHello version random session cipherIDs compressionIDs exts Nothing) = do
 	putVersion version
 	putClientRandom32 random
 	putSession session
@@ -411,7 +451,7 @@ decodeExtSecureRenegotiation isServerHello = runGetErr "ext-secure-renegotiation
 	l <- fromIntegral <$> getWord8
 	if isServerHello
 		then do
-			cvd <- getBytes (l `div` 2) 
+			cvd <- getBytes (l `div` 2)
 			svd <- getBytes (l `div` 2)
 			return (cvd, Just svd)
 		else getBytes (l `div` 2) >>= \cvd -> return (cvd, Nothing)

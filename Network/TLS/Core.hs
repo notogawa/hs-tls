@@ -1,5 +1,6 @@
 {-# OPTIONS_HADDOCK hide #-}
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE OverloadedStrings #-}
 -- |
 -- Module      : Network.TLS.Core
 -- License     : BSD-style
@@ -90,11 +91,23 @@ readExact ctx sz = do
 	return hdrbs
 
 recvRecord :: MonadIO m => TLSCtx c -> m (Either TLSError (Record Plaintext))
-recvRecord ctx = readExact ctx 5 >>= either (return . Left) recvLength . decodeHeader
+recvRecord ctx = do
+	header <- readExact ctx 2
+	if B.head header < 0x80
+		then readExact ctx 3 >>= either (return . Left) recvLength . decodeHeader . B.append header
+		else either (return . Left) recvDeprecatedLength $ decodeDeprecatedHeaderLength header
 	where recvLength header@(Header _ _ readlen)
-		| readlen > 16384 + 2048 = return $ Left $ Error_Protocol ("record exceeding maximum size", True, RecordOverflow)
+		| readlen > 16384 + 2048 = return $ Left maximumSizeExceeded
+		| otherwise              = readExact ctx (fromIntegral readlen) >>= makeRecord ctx header
+	      recvDeprecatedLength readlen
+		| readlen > 1024 * 4     = return $ Left maximumSizeExceeded
 		| otherwise              = do
 			content <- readExact ctx (fromIntegral readlen)
+			case decodeDeprecatedHeader readlen content of
+				Left err     -> return $ Left err
+				Right header -> makeRecord ctx header content
+	      maximumSizeExceeded = Error_Protocol ("record exceeding maximum size", True, RecordOverflow)
+	      makeRecord ctx header content = do
 			liftIO $ (loggingIORecv $ ctxLogging ctx) header content
 			usingState ctx $ disengageRecord $ rawToRecord header (fragmentCiphertext content)
 
@@ -266,7 +279,7 @@ handshakeClient ctx = do
 			usingState_ ctx (startHandshakeClient ver crand)
 			sendPacket ctx $ Handshake
 				[ ClientHello ver crand clientSession (map cipherID ciphers)
-					      (map compressionID compressions) extensions
+					      (map compressionID compressions) extensions Nothing
 				]
 
 		expectChangeCipher ChangeCipherSpec = return $ RecvStateHandshake expectFinish
@@ -359,7 +372,7 @@ handshakeClient ctx = do
 			throwCore $ Error_Protocol ("certificate rejected: " ++ s, True, CertificateUnknown)
 
 handshakeServerWith :: MonadIO m => TLSCtx c -> Handshake -> m ()
-handshakeServerWith ctx clientHello@(ClientHello ver _ clientSession ciphers compressions _) = do
+handshakeServerWith ctx clientHello@(ClientHello ver _ clientSession ciphers compressions _ _) = do
 	-- check if policy allow this new handshake to happens
 	handshakeAuthorized <- withMeasure ctx (onHandshake $ ctxParams ctx)
 	unless handshakeAuthorized (throwCore $ Error_HandshakePolicy "server: handshake denied")
@@ -508,7 +521,7 @@ recvData ctx = do
 	pkt <- recvPacket ctx
 	case pkt of
 		-- on server context receiving a client hello == renegotiation
-		Right (Handshake [ch@(ClientHello _ _ _ _ _ _)]) ->
+		Right (Handshake [ch@(ClientHello _ _ _ _ _ _ _)]) ->
 			handshakeServerWith ctx ch >> recvData ctx
 		-- on client context, receiving a hello request == renegotiation
 		Right (Handshake [HelloRequest]) ->
@@ -519,9 +532,10 @@ recvData ctx = do
 		Right (Alert [(AlertLevel_Warning, CloseNotify)]) -> do
 			setEOF ctx
 			return B.empty
-		Right (AppData x) -> return x
-		Right p           -> error ("error unexpected packet: " ++ show p)
-		Left err          -> error ("error received: " ++ show err)
+		Right (AppData "") -> recvData ctx
+		Right (AppData x)  -> return x
+		Right p            -> error ("error unexpected packet: " ++ show p)
+		Left err           -> error ("error received: " ++ show err)
 
 recvData' :: MonadIO m => TLSCtx c -> m L.ByteString
 recvData' ctx = recvData ctx >>= return . L.fromChunks . (:[])
